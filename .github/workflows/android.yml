@@ -4,7 +4,40 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ---------------------------------------------------------------------
+  # JOB 1: chequeos rápidos de JS/TS. Falla en 1-2 min en vez de que
+  # descubras un error tonto después de esperar toda la compilación nativa.
+  # Si tu fork NO tiene los scripts "lint" o "typecheck" en package.json,
+  # borra el paso correspondiente (o este job completo).
+  # ---------------------------------------------------------------------
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "yarn"
+
+      # Yarn, NO npm: el proyecto está fijado a yarn.lock (packageManager
+      # en package.json). Usar npm resuelve versiones distintas a las
+      # esperadas y es la causa más probable de que la app "abra y cierre".
+      - name: Install dependencies (yarn)
+        run: yarn install --frozen-lockfile
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Typecheck
+        run: yarn typecheck
+
+  # ---------------------------------------------------------------------
+  # JOB 2: build nativo de Android. Solo corre si "checks" pasó limpio.
+  # ---------------------------------------------------------------------
   build:
+    needs: checks
     runs-on: ubuntu-latest
 
     steps:
@@ -14,12 +47,14 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: zulu
-          java-version: '21'
+          java-version: "21"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: "yarn"
+
       - name: Setup Gradle Cache
         uses: actions/cache@v4
         with:
@@ -30,19 +65,43 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Install dependencies
-        run: npm install
+      # Cachea node_modules (incluye los binarios nativos que llama.rn
+      # descarga en postinstall). En corridas siguientes con el mismo
+      # yarn.lock, se salta la descarga por completo.
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-modules-${{ hashFiles('yarn.lock') }}
+
+      - name: Install dependencies (yarn)
+        run: yarn install --frozen-lockfile
 
       - name: Build Android APK
         env:
           GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.workers.max=2
           MAKEFLAGS: -j2
-          CMAKE_BUILD_PARALLEL_LEVEL: '2'
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: |
           cd android
-          ./gradlew assembleProdDebug -Pandroid.injected.build.abi=arm64-v8a --no-daemon
+          ./gradlew assembleProdDebug -Pandroid.injected.build.abi=arm64-v8a --no-daemon --stacktrace
+
+      # Si el build de arriba falla, este paso corre igual (if: always())
+      # y sube el log completo de Gradle como artefacto descargable, para
+      # que veas TODO el error de una vez en vez de adivinar por partes.
+      - name: Upload full Gradle log on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: |
+            android/app/build/outputs/logs/**
+            android/build/reports/**
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: app-prod-debug
