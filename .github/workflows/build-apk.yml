@@ -19,13 +19,42 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+
       - name: Install dependencies
         run: npm install
+
+      # --- FIX ONNX Runtime C++ (mismo problema que en el build local) ---
+      - name: Patch onnxruntime-react-native C++ sources
+        run: |
+          CPP_DIR="node_modules/onnxruntime-react-native/cpp"
+          for f in "$CPP_DIR/TensorUtils.cpp" "$CPP_DIR/InferenceSessionHostObject.cpp"; do
+            if [ -f "$f" ]; then
+              sed -i -E 's/([A-Za-z0-9_]+)\.(GetSymbolicDimensions\()/\1->\2/g' "$f"
+              sed -i -E 's/Value ([A-Za-z0-9_]+);/Value \1(nullptr);/g' "$f"
+              echo "patched $f"
+            else
+              echo "WARN: $f no existe, se omite"
+            fi
+          done
+
+      # --- FIX arquitectura: la propiedad correcta para RN es reactNativeArchitectures ---
+      - name: Restrict build to arm64-v8a
+        run: |
+          PROPS="android/gradle.properties"
+          if grep -q "^reactNativeArchitectures=" "$PROPS"; then
+            sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a/' "$PROPS"
+          else
+            echo "reactNativeArchitectures=arm64-v8a" >> "$PROPS"
+          fi
+          grep "^reactNativeArchitectures=" "$PROPS"
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
 
       - name: Build Android APK
         run: |
           cd android
-          ./gradlew assembleProdDebug -Pandroid.injected.build.abi=arm64-v8a --no-daemon
+          ./gradlew assembleProdDebug --no-daemon -PreactNativeArchitectures=arm64-v8a
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
