@@ -118,7 +118,11 @@ jobs:
           EOL
 
       # Restringe la arquitectura nativa a arm64-v8a (Helio G88).
-      # Refuerza vía gradle.properties además del flag -P de abajo.
+      # IMPORTANTE: reactNativeArchitectures en gradle.properties NO basta
+      # en este repo — android/app/build.gradle tiene un abiFilters
+      # hardcodeado ("arm64-v8a", "x86_64") en defaultConfig.ndk que no lee
+      # esa propiedad. Hay que parchear ambos o el build sigue compilando
+      # también para x86_64 (build más lento, sin beneficio para el Spark 10 Pro).
       - name: Restrict build to arm64-v8a
         run: |
           PROPS="android/gradle.properties"
@@ -128,6 +132,10 @@ jobs:
             echo "reactNativeArchitectures=arm64-v8a" >> "$PROPS"
           fi
           grep "^reactNativeArchitectures=" "$PROPS"
+
+          APP_GRADLE="android/app/build.gradle"
+          sed -i 's/abiFilters "arm64-v8a", "x86_64"/abiFilters "arm64-v8a"/' "$APP_GRADLE"
+          grep -n "abiFilters" "$APP_GRADLE"
 
       # Red de seguridad heredada de una investigación anterior: si en algún
       # punto el proyecto llegara a depender de onnxruntime-react-native,
