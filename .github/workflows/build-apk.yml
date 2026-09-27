@@ -1,43 +1,124 @@
-name: Build Android APK
+name: Build Device Test APK (arm64-v8a)
 
+# Workflow aislado, solo para generar un APK debug instalable para pruebas
+# en dispositivo (Tecno Spark 10 Pro / Helio G88). NO reemplaza ni modifica
+# el CI Pipeline de producción (build-android en ci.yml sigue intacto).
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  build-android-debug-arm64:
     runs-on: ubuntu-latest
+    env:
+      # Igual que en el CI Pipeline real: llama.rn trae su propio
+      # gradle.properties que sobreescribe el del root, así que esto
+      # solo se puede fijar por variable de entorno o -P.
+      ORG_GRADLE_PROJECT_rnllamaBuildFromSource: 'true'
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out code
+        uses: actions/checkout@v3
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: '21'
+      # Igual que en el job real: debe ir antes de setup-node/setup-java.
+      - name: Maximize build space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          df -h /
 
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
+      - name: Cache node_modules
+        uses: actions/cache@v3
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('yarn.lock') }}
+
+      - name: Install Yarn
+        run: npm install -g yarn
+
       - name: Install dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
 
-      # --- FIX ONNX Runtime C++ (mismo problema que en el build local) ---
-      - name: Patch onnxruntime-react-native C++ sources
+      - name: Derive the rnllama variant allowlist from the payload manifest
         run: |
-          CPP_DIR="node_modules/onnxruntime-react-native/cpp"
-          for f in "$CPP_DIR/TensorUtils.cpp" "$CPP_DIR/InferenceSessionHostObject.cpp"; do
-            if [ -f "$f" ]; then
-              sed -i -E 's/([A-Za-z0-9_]+)\.(GetSymbolicDimensions\()/\1->\2/g' "$f"
-              sed -i -E 's/Value ([A-Za-z0-9_]+);/Value \1(nullptr);/g' "$f"
-              echo "patched $f"
-            else
-              echo "WARN: $f no existe, se omite"
-            fi
-          done
+          set -euo pipefail
+          VARIANTS=$(node scripts/verify-android-payload.js --print-variants)
+          echo "Declared allowlist: $VARIANTS"
+          echo "ORG_GRADLE_PROJECT_rnllamaVariants=$VARIANTS" >> "$GITHUB_ENV"
 
-      # --- FIX arquitectura: la propiedad correcta para RN es reactNativeArchitectures ---
+      - name: Cache llama.rn native build tree
+        uses: actions/cache@v4
+        with:
+          path: node_modules/llama.rn/android/.cxx
+          key: ${{ runner.os }}-cxx-${{ hashFiles('yarn.lock', 'scripts/android-payload-manifest.json') }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Set up the Hexagon SDK
+        uses: ./.github/actions/setup-hexagon-sdk
+
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+
+      - name: Create dummy google-services.json for CI
+        run: |
+          cat > android/app/google-services.json << 'EOL'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "dummy-project-for-ci",
+              "storage_bucket": "dummy-project-for-ci.appspot.com"
+            },
+            "client": [{
+              "client_info": {
+                "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
+                "android_client_info": {
+                  "package_name": "com.pocketpalai"
+                }
+              },
+              "api_key": [{
+                "current_key": "dummy-api-key-for-ci-builds"
+              }]
+            }]
+          }
+          EOL
+
+      - name: Create dummy .env file for CI
+        run: |
+          cat > .env << 'EOL'
+          FIREBASE_FUNCTIONS_URL=https://dummy-firebase-url.com
+
+          # PalsHub/Supabase Configuration
+          SUPABASE_URL=https://dummy-supabase-url.supabase.co
+          SUPABASE_ANON_KEY=dummy-anon-key-for-ci-builds
+          PALSHUB_API_BASE_URL=https://dummy-palshub-api.com
+
+          # App Configuration
+          APP_URL=pocketpal://app
+
+          # Feature Flags (true/false)
+          ENABLE_PALSHUB_INTEGRATION=true
+          ENABLE_AUTHENTICATION=true
+          ENABLE_OFFLINE_MODE=true
+
+          # Google Sign-In Configuration
+          GOOGLE_IOS_CLIENT_ID=dummy-ios-client-id.apps.googleusercontent.com
+          GOOGLE_WEB_CLIENT_ID=dummy-web-client-id.apps.googleusercontent.com
+          EOL
+
+      # Restringe la arquitectura nativa a arm64-v8a (Helio G88).
+      # Refuerza vía gradle.properties además del flag -P de abajo.
       - name: Restrict build to arm64-v8a
         run: |
           PROPS="android/gradle.properties"
@@ -48,16 +129,46 @@ jobs:
           fi
           grep "^reactNativeArchitectures=" "$PROPS"
 
+      # Red de seguridad heredada de una investigación anterior: si en algún
+      # punto el proyecto llegara a depender de onnxruntime-react-native,
+      # corrige dos errores conocidos de compilación NDK. Si esos archivos
+      # no existen (caso actual, el proyecto usa llama.rn), simplemente se
+      # omite sin fallar el build.
+      - name: Patch onnxruntime-react-native C++ sources (no-op si no existe)
+        run: |
+          CPP_DIR="node_modules/onnxruntime-react-native/cpp"
+          for f in "$CPP_DIR/TensorUtils.cpp" "$CPP_DIR/InferenceSessionHostObject.cpp"; do
+            if [ -f "$f" ]; then
+              sed -i -E 's/([A-Za-z0-9_]+)\.(GetSymbolicDimensions\()/\1->\2/g' "$f"
+              sed -i -E 's/Value ([A-Za-z0-9_]+);/Value \1(nullptr);/g' "$f"
+              echo "patched $f"
+            else
+              echo "OK: $f no existe en este proyecto, se omite (esperado: el proyecto usa llama.rn)."
+            fi
+          done
+
       - name: Make gradlew executable
         run: chmod +x android/gradlew
 
-      - name: Build Android APK
+      # assembleProdDebug: variante debug, firma automática con el keystore
+      # de debug de Android (no requiere el keystore dummy de release ni
+      # los checks de DCE/payload, que son solo para el build de producción).
+      - name: Build Android Debug APK (arm64-v8a only)
+        working-directory: android
         run: |
-          cd android
-          ./gradlew assembleProdDebug --no-daemon -PreactNativeArchitectures=arm64-v8a
+          set -euo pipefail
+          if [ "${ORG_GRADLE_PROJECT_rnllamaBuildFromSource:-}" != "true" ]; then
+            echo "::error::ORG_GRADLE_PROJECT_rnllamaBuildFromSource no es 'true'."
+            exit 1
+          fi
+          ./gradlew assembleProdDebug --no-daemon -PreactNativeArchitectures=arm64-v8a 2>&1 | tee android-build.log
 
-      - name: Upload APK
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || echo "ccache unavailable (su paso de setup no se completó)"
+
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-prod-debug
+          name: pocketpal-device-test-apk-arm64
           path: android/app/build/outputs/apk/prod/debug/app-prod-debug.apk
